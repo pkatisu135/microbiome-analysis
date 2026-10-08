@@ -1,0 +1,610 @@
+---
+title: "16S rRNA Microbiome Pipeline using DADA2 - full dataset"
+subtitle: "Memory-Efficient ASV Inference, Taxonomy, Phyloseq Exploration, and Differential Abundance (Mouse Gut, full dataset)
+author: "PDA"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+editor_options:
+  chunk_output_type: console
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+Download the 16S reference genome (to be used for taxonomy here: [**https://zenodo.org/records/4587955**](https://zenodo.org/records/4587955){.uri} (SILVA v138.1)) *silva_nr99_v138.1_train_set.fa.gz* - train data *silva_species_assignment_v138.1.fa.gz* - species data
+
+## Package Installation
+
+```{r install-packages}
+# CRAN packages
+install.packages(c(
+  "ggplot2", "devtools", "vegan", "dplyr",
+  "tidyverse", "remotes", "ggpubr", "rstatix",
+  "stringr", "data.table", "lubridate"
+))
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+{
+  install.packages("BiocManager")
+}
+BiocManager::install(c("dada2", "phyloseq", "DESeq2",
+                       "ANCOMBC", "Biostrings", "microbiome"))
+
+# nicer plots
+devtools::install_github("thomasp85/patchwork")
+remotes::install_github("gavinsimpson/ggvegan")
+```
+
+## Config paths
+
+```{r config}
+library(dada2)
+library(data.table)
+packageVersion("dada2")
+
+# Paths
+# Raw, gzipped FASTQs
+data <- "~/mouse_full_data/data"
+
+# project folder for all derived outputs
+proj_dir <- "~/mouse_full_data/"
+
+# r object file dir
+rds_dir <- file.path(proj_dir, "rds")
+
+# filtered fastqs written by DADA2
+filt_dir <- file.path(data, "filtered")
+
+# SILVA training data files(for taxonomy)
+ref_dir <- file.path(proj_dir, "reference")
+
+# Directory specifically for saving exported plot graphics
+plot_dir <- file.path(proj_dir, "plots")
+
+# Directory specifically saving table outputs (CSVs)
+table_dir <- file.path(proj_dir, "tables")
+
+for (d in c(proj_dir, rds_dir, filt_dir, ref_dir, plot_dir, table_dir)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+
+# SILVA Reference DB
+silva_train <- file.path(ref_dir, "silva_nr99_v138.1_train_set.fa.gz")
+silva_species <- file.path(ref_dir, "silva_species_assignment_v138.1.fa.gz")
+
+# Threading (for memory and faster processing)
+N_THREADS <- max(1, parallel::detectCores() - 1) # for filtering/denoising
+TAX_THREADS <- 2 # keep low for taxonomy genx
+TAX_CHUNK <- 2000 # ASVs per taxonomy batch
+
+# Helper: report current R memory use
+mem_report <- function(tag = "") {
+  gc(full = TRUE)
+  used_mb <- sum(gc()[, "used"] * c(8,8)) / 1e6
+  cat(sprintf("[MEM %s] R heap ~%.0f MB\n", tag, used_mb))
+  invisible(NULL)
+}
+```
+
+## The Dataset
+
+This is the full **Schloss lab** mouse-gut dataset with the following convention
+
+```         
+M1D13_S12_L001_R1_001.fastq.gz
+└───┘ └─┘ └──┘ └┘ └─┘
+  │    │    │   │   └ read chunk index
+  │    │    │   └──── read direction (R1 = forward, R2 = reverse)
+  │    │    └──────── lane
+  │    └───────────── Illumina sample number (S12)
+  └────────────────── sample id (M1D13)
+```
+
+## Read in and sort the fastq file names
+
+```{r list-fastqs}
+# forward (R1) and reverse (R2) reads
+dataF <- sort(list.files(data, pattern = "_R1_001\\.fastq\\.gz$", full.names = TRUE))
+dataR <- sort(list.files(data, pattern = "_R2_001\\.fastq\\.gz$", full.names = TRUE))
+
+# sample ID
+sample.names <- sapply(strsplit(basename(dataF), "_"), `[`, 1)
+cat("Forward files:", length(dataF)," Reverse files:", length(dataR), "\n")
+cat("First few samples:", paste(head(sample.names), collapse = ", "), "\n")
+
+# sanity checks
+stopifnot(length(dataF) == length(dataR))
+# confirm R1/R2 line up sample-for-sample
+ok <- identical(
+  sub("_R1_001\\.fastq\\.gz$", "", basename(dataF)),
+  sub("_R2_001\\.fastq\\.gz$", "", basename(dataR))
+)
+stopifnot(ok)
+```
+
+## Step 1: Inspect Read Quality Profiles
+
+```{r qc-forward}
+library(ggplot2)
+p_qc_f <- plotQualityProfile(dataF[1:16], aggregate = FALSE)
+print(p_qc_f)
+ggsave(filename = file.path(plot_dir, "qc_forward.png"), plot = p_qc_f, width = 14, height = 10, dpi = 700)
+```
+
+```{r qc-reverse}
+p_qc_r <- plotQualityProfile(dataR[1:16], aggregate = FALSE) 
+print(p_qc_r)
+ggsave(filename = file.path(plot_dir, "qc_reverse.png"), plot = p_qc_r, width = 14, height = 10, dpi = 300)
+```
+
+## Step 2: Filter and Trim
+
+```{r filter-paths}
+filt.dataF <- file.path(filt_dir, paste0(sample.names, "_F_filt.fastq.gz"))
+filt.dataR <- file.path(filt_dir, paste0(sample.names, "_R_filt.fastq.gz"))
+
+names(filt.dataF) <- sample.names
+names(filt.dataR) <- sample.names
+```
+
+| Parameter | Forward | Reverse | Meaning |
+|-------------------|------------------|------------------|------------------|
+| `truncLen` | 240 | 160 | Truncate reads at this length (guided by quality plots) |
+| `maxEE` | 2 | 2 | Max expected errors per read |
+| `maxN` | 0 | 0 | No ambiguous bases allowed |
+| `truncQ` | 2 | 2 | Truncate at first base with quality ≤ 2 |
+| `rm.phix` | TRUE | TRUE | Remove PhiX control reads |
+
+```{r filter-and-trim}
+out <- filterAndTrim(
+  dataF, filt.dataF, dataR, filt.dataR,
+  truncLen = c(240, 160),
+  maxN = 0, maxEE = c(2, 2), truncQ = 2, rm.phix = TRUE,
+  compress = TRUE, multithread = N_THREADS
+)
+head(out)
+
+# some samples can lose ALL reads after filtering which can break downstream steps - drop them
+kept <- file.exists(filt.dataF) &
+  file.exists(filt.dataR)
+if (any(!kept)) {
+  message("Dropping ", sum(!kept), " sample(s) with no reads after filtering: ",
+          paste(sample.names[!kept], collapse = ", "))
+}
+filt.dataF <- filt.dataF[kept]
+filt.dataR <- filt.dataR[kept]
+sample.names <- sample.names[kept]
+
+saveRDS(out, file.path(rds_dir, "filter_out.rds"))
+saveRDS(sample.names, file.path(rds_dir, "sample_names.rds"))
+```
+
+```{r qc-after-filter}
+p_post_r <- plotQualityProfile(filt.dataR[1:16], aggregate = FALSE)
+ggsave(filename = file.path(plot_dir, "qc_reverse_post_filter.png"), plot = p_post_r, width = 14, height = 10, dpi = 700)
+
+p_post_f <- plotQualityProfile(filt.dataF[1:16], aggregate = FALSE)
+ggsave(filename = file.path(plot_dir, "qc_forward_post_filter.png"), plot = p_post_f, width = 14, height = 10, dpi = 700)
+```
+
+## Step 3: Learn the Error Rates
+
+```{r learn-errors}
+errF <- learnErrors(filt.dataF, multithread = N_THREADS)
+errR <- learnErrors(filt.dataR, multithread = N_THREADS)
+
+saveRDS(errF, file.path(rds_dir, "errF.rds"))
+saveRDS(errR, file.path(rds_dir, "errR.rds"))
+mem_report("after learnErrors")
+```
+
+```{r plot-errors}
+p_err_f <- plotErrors(errF, nominalQ = TRUE)
+ggsave(filename = file.path(plot_dir, "errors_forward.png"), plot = p_err_f, width = 14, height = 10, dpi = 700)
+
+p_err_r <- plotErrors(errR, nominalQ = TRUE)
+ggsave(filename = file.path(plot_dir, "errors_reverse.png"), plot = p_err_r, width = 14, height = 10, dpi = 700)
+```
+
+## Steps 4 - 5: Denoise + Merge
+
+This is a memory-critical step and requires optimization. Instead of calling `dada2()` on **all** samples at once, loop **one sample at a time**: `dereplicate -> denoise F -> denoise R -> merge -> store only merged result -> free everything else -> gc()`
+
+```{r denoise-merge-loop}
+# (Re)load inputs - this block can be rerun in case session ends due to memory depletion 
+sample.names <- readRDS(file.path(rds_dir, "sample_names.rds")) 
+errF <- readRDS(file.path(rds_dir, "errF.rds")) 
+errR <- readRDS(file.path(rds_dir, "errR.rds"))
+filt.dataF <- file.path(filt_dir, paste0(sample.names, "_F_filt.fastq.gz")); names(filt.dataF) <- sample.names
+filt.dataR <- file.path(filt_dir, paste0(sample.names, "_R_filt.fastq.gz")); names(filt.dataR) <- sample.names
+
+mergers <- vector("list", length(sample.names)); names(mergers) <- sample.names
+
+denoisedF <- integer(length(sample.names)); names(denoisedF) <- sample.names
+denoisedR <- integer(length(sample.names)); names(denoisedR) <- sample.names
+
+getN <- function(x) sum(getUniques(x))
+
+for (sam in sample.names) {
+  cat("Denoising:", sam, "\n")
+  
+  derepF <- derepFastq(filt.dataF[[sam]])
+  ddF <- dada(derepF, err = errF, multithread = N_THREADS)
+  
+  derepR <- derepFastq(filt.dataR[[sam]])
+  ddR <- dada(derepR, err = errR, multithread = N_THREADS)
+  
+  merger <- mergePairs(ddF, derepF, ddR, derepR, verbose = FALSE)
+  
+  mergers[[sam]] <- merger
+  denoisedF[[sam]] <- getN(ddF)
+  denoisedR[[sam]] <- getN(ddR)
+  
+  # free per-sample objects before the next iteration
+  rm(derepF, derepR, ddF, ddR, merger)
+  gc(full = TRUE)
+}
+
+saveRDS(mergers, file.path(rds_dir, "mergers.rds"))
+saveRDS(denoisedF, file.path(rds_dir, "denoisedF.rds"))
+saveRDS(denoisedR, file.path(rds_dir, "denoisedR.rds"))
+
+mem_report("after denoise+merge loop")
+```
+
+## Step 6: Make the Sequence Table
+
+```{r make-seqtab}
+mergers <- readRDS(file.path(rds_dir, "mergers.rds"))
+
+seqtab <- makeSequenceTable(mergers)
+cat("Samples x ASVs:", paste(dim(seqtab), collapse = " x "), "\n")
+print(table(nchar(getSequences(seqtab))))
+
+saveRDS(seqtab, file.path(rds_dir, "seqtab.rds"))
+```
+
+## Step 7: Remove Chimeras
+
+```{r remove-chimeras}
+seqtab <- readRDS(file.path(rds_dir, "seqtab.rds"))
+
+seqtab.nochim <- removeBimeraDenovo(
+  seqtab, method = "consensus", multithread = N_THREADS, verbose = TRUE
+)
+
+cat("Non-chimeric ASVs:", ncol(seqtab.nochim), "\n")
+cat("Fraction of reads kept:", round(sum(seqtab.nochim) / sum(seqtab), 4), "\n")
+
+saveRDS(seqtab.nochim, file.path(rds_dir, "seqtab_nochim.rds"))
+```
+
+## Step 8: Track Reads the Pipeline
+
+```{r track-reads}
+out <- readRDS(file.path(rds_dir, "filter_out.rds"))
+sample.names <- readRDS(file.path(rds_dir, "sample_names.rds"))
+denoisedF <- readRDS(file.path(rds_dir, "denoisedF.rds"))
+denoisedR <- readRDS(file.path(rds_dir, "denoisedR.rds"))
+mergers <- readRDS(file.path(rds_dir, "mergers.rds"))
+seqtab.nochim <- readRDS(file.path(rds_dir, "seqtab_nochim.rds"))
+
+getM <- function(x) sum(getUniques(x))
+
+# Align the filter matrix to surviving samples
+out2 <- out[paste0(sample.names, "_F_filt.fastq.gz") %in% basename(names(denoisedF)) | TRUE, , drop = FALSE]
+
+# rebuild from saved pieces matched by sample_id
+track <- cbind(
+  input = out[, "reads.in"][seq_along(sample.names)],
+  filtered = out[, "reads.out"][seq_along(sample.names)],
+  denoisedF = denoisedF,
+  denoisedR = denoisedR,
+  merged = sapply(mergers, getN),
+  nonchim = rowSums(seqtab.nochim)[sample.names]
+)
+rownames(track) <- sample.names
+head(track, 10)
+
+# Export processing tracking summary table
+write.csv(track, file = file.path(table_dir, "pipeline_read_tracking.csv"), row.names = TRUE)
+```
+
+## Step 9: Assign Taxonomy - **chunked + low-thread**
+
+```{r assign-taxonomy-chunked}
+seqtab.nochim <- readRDS(file.path(rds_dir, "seqtab_nochim.rds"))
+stopifnot(file.exists(silva_train)) # check that 16S ref is present
+
+seqs <- getSequences(seqtab.nochim)
+chunks <- split(seqs, ceiling(seq_along(seqs) / TAX_CHUNK))
+cat("Assigning taxonomy for", length(seqs), "ASVs in", length(chunks), "chunk(s)\n")
+
+taxa_chunks <- vector("list", length(chunks))
+for (i in seq_along(chunks)) {
+  cat(sprintf(" chunk %d / %d (%d ASVs)\n", i, length(chunks), length(chunks[[i]])))
+  taxa_chunks[[i]] <- assignTaxonomy(
+    chunks[[i]], silva_train,
+    multithread = TAX_THREADS,
+    tryRC = TRUE # guards against reverse-complement orientation issues
+  )
+  gc(full = TRUE) # release the reference + chunk before the next batch
+}
+
+taxa <- do.call(rbind, taxa_chunks)
+rm(taxa_chunks); gc(full = TRUE)
+
+# Species assignment - only run this if you have the species files
+if (file.exists(silva_species)) {
+  sp_chunks <- split(rownames(taxa), ceiling(seq_len(nrow(taxa)) / TAX_CHUNK))
+  taxa_sp <- vector("list", length(sp_chunks))
+  for (i in seq_along(sp_chunks)) {
+    sub <- taxa[sp_chunks[[i]], , drop = FALSE]
+    taxa_sp[[i]] <- addSpecies(sub, silva_species)
+    gc(full = TRUE)
+  }
+  taxa <- do.call(rbind, taxa_sp)
+  rm(taxa_sp); gc(full = TRUE)
+}
+
+saveRDS(taxa, file.path(rds_dir, "taxa.rds"))
+mem_report("after taxonomy")
+```
+
+```{r taxa-inspect}
+taxa.print <- taxa
+rownames(taxa.print) <- NULL
+head(taxa.print)
+
+table(taxa[, "Phylum"], useNA = "ifany")
+cat("ASVs with a species-level call:", sum(!is.na(taxa[, "Species"])), "of", nrow(taxa), "\n")
+```
+
+## Step 10: Build the Phyloseq object
+
+```{r load-phyloseq}
+library(phyloseq)
+library(Biostrings)
+library(ggplot2)
+theme_set(theme_bw())
+
+seqtab.nochim <- readRDS(file.path(rds_dir, "seqtab_nochim.rds"))
+taxa <- readRDS(file.path(rds_dir, "taxa.rds"))
+```
+
+```{r build-metadata}
+samples.out <- rownames(seqtab.nochim)
+
+# group/gender = leading letters; subjects = digits before "D"
+gender_code <- sub("^([A-Za-z]+).*$", "\\1", samples.out)
+subject <- sub("^[A-Za-z]+([0-9]+)D.*$", "\\1", samples.out)
+day <- suppressWarnings(as.integer(sub("^.*D([0-9]+)$", "\\1", samples.out)))
+
+samdf <- data.frame(
+  Sample = samples.out,
+  Gender = ifelse(gender_code == "F", "Female",
+                  ifelse(gender_code == "M", "Male", gender_code)),
+  Subject = subject,
+  Day = day,
+  row.names = samples.out,
+  stringsAsFactors = FALSE
+)
+
+# Early vs Late
+samdf$When <- ifelse(samdf$Day < 100, "Early", "Late")
+
+# Mock/Control samples will not fit longitudinal design
+is_ctrl <- grepl("mock|control|blank|ntc", samples.out, ignore.case = TRUE) | is.na(samdf$Day)
+samdf$When[is_ctrl] <- NA
+samdf$Subject[is_ctrl] <- NA
+
+write.csv(samdf, file = file.path(table_dir, "sample metadata.csv"), row.names = TRUE)
+table(samdf$When, useNA = "ifany")
+```
+
+## Construct the object
+
+```{r build-phyloseq}
+ps <- phyloseq(
+  otu_table(seqtab.nochim, taxa_are_rows = FALSE),
+  sample_data(samdf),
+  tax_table(taxa)
+)
+
+# replace long ASV sequences with short labels; keep sequences in refseq()
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+
+ps
+saveRDS(ps, file.path(rds_dir, "phyloseq.rds"))
+```
+
+## Alpha Diversity
+
+```{r alpha-diversity, fig.wdth=9}
+# plot_richness expects raw counts (do not rarefy/transform first)
+p_alpha <- plot_richness(ps, x = "Day", measures = c("Shannon", "Simpson"), color = "When")
+ggsave(filename = file.path(plot_dir, "alpha_diversity.png"), plot = p_alpha, width = 9, height = 5, dpi = 700)
+```
+
+## Ordination (NMDS, Bray-Curtis)
+
+```{r ordination}
+ps.prop <- transform_sample_counts(ps, function(x) x / sum(x))
+ord.nmds.bray <- ordinate(ps.prop, method = "NMDS", distance = "bray")
+
+p_ord <- plot_ordination(ps.prop, ord.nmds.bray, color = "When", title = "NMDS (Bray-Curtis)")
+ggsave(filename = file.path(plot_dir, "ordination_nmds_bray.png"), plot = p_ord, width = 7, height = 5, dpi = 700)
+```
+
+## Abundance barplot (abundant families only)
+
+```{r abundance-barplot, fig.width=11}
+abundant <- taxa_names(ps)[taxa_sums(ps) > 500]
+ps.ab <- transform_sample_counts(prune_taxa(abundant, ps), function(x) x / sum(x))
+
+p_bar <- plot_bar(ps.ab, x = "Sample", fill = "Family") + facet_wrap(~When, scales = "free_x")
+ggsave(filename = file.path(plot_dir, "abundance_plot_family.png"), plot = p_bar, width = 14, height = 10, dpi = 700)
+```
+
+## Step 11: Differential Abundance Analysis
+
+**Goal:** find ASVs/taxa whose abundance differs between *Early* and *Late* samples. Two complementary methods will be used: - **DESeq2**: Fast, familiar, integrates directly with the `ps` object
+
+- **ANCOM-BC2**: compositionally-aware method with bias correction. Generally more appropriate default for microbiome relative-abundance data *NB: agreement between methods is reassuring*
+
+```{r da-subset}
+# build a clean data subset - drop controls and any empty ASVs
+ps <- readRDS(file.path(rds_dir, "phyloseq.rds"))
+
+ps_da <- subset_samples(ps, !is.na(When))
+ps_da <- prune_taxa(taxa_sums(ps_da) > 0, ps_da)
+
+# prevalence filter: keep ASVs seen in >= 10% of samples - remove ultra-rare taxa that are just noise
+prev <- apply(otu_table(ps_da), 2, function(x) sum(x > 0))
+keep <- prev >= max(2, ceiling(0.10 * nsamples(ps_da)))
+ps_da <- prune_taxa(taxa_names(ps_da)[keep], ps_da)
+
+# fix reference level so positive results = enriched in "Late"
+sample_data(ps_da)$When <- factor(sample_data(ps_da)$When, levels = c("Early", "Late"))
+
+ps_da
+```
+
+## 11a. DESeq2
+
+```{r da-deseq2}
+library(DESeq2)
+
+# Gaurd against empty samples / taxa left behind by the prevalence filter
+ps_da <- prune_samples(sample_sums(ps_da) > 0, ps_da)
+ps_da <- prune_taxa(taxa_sums(ps_da) > 0, ps_da)
+
+dds <- phyloseq_to_deseq2(ps_da, ~ When)
+
+dds <- estimateSizeFactors(dds, type = "poscounts")
+
+# sanity check - no NA size factors now
+stopifnot(all(!is.na(sizeFactors(dds))))
+
+dds <- DESeq(dds, test = "Wald", fitType = "local")
+res <- results(dds, cooksCutoff = FALSE)
+
+alpha <- 0.05
+sigtab <- as.data.frame(res)
+sigtab <- cbind(sigtab, as(tax_table(ps_da)[rownames(sigtab), ], "matrix"))
+sigtab <- sigtab[!is.na(sigtab$padj) & sigtab$padj < alpha, ]
+sigtab <- sigtab[order(sigtab$log2FoldChange), ]
+
+cat("DESeq2: significant ASVs at padj <", alpha, ":", nrow(sigtab), "\n")
+head(sigtab[, c("baseMean", "log2FoldChange", "padj", "Phylum", "Family", "Genus")], 20)
+
+write.csv(as.data.frame(res), file = file.path(table_dir, "deseq2_results.csv"), row.names = TRUE)
+write.csv(sigtab, file = file.path(table_dir, "deseq2_sigtab.csv"), row.names = TRUE)
+
+saveRDS(res, file.path(rds_dir, "deseq2_results.rds"))
+saveRDS(sigtab, file.path(rds_dir, "deseq2_sigtab.rds"))
+```
+
+```{r da-deseq2-plot, fig.width=9, fig.height=6}
+if (nrow(sigtab) > 0) {
+  sigtab$Genus <- factor(sigtab$Genus, levels = unique(sigtab$Genus[order(sigtab$log2FoldChange)]))
+
+p_deseq <- ggplot(sigtab, aes(x = log2FoldChange, y = Genus, color = Phylum)) + geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") + geom_point(size = 3, alpha = 0.8) + labs(title = "DESeq2: Early vs Late (positive = enriched in Late)", x = "log2 fold change", y = "Genus") + theme(axis.text.y = element_text(size = 8))
+
+ggsave(filename = file.path(plot_dir, "da_deseq2_plot.png"), plot = p_deseq, width = 18, height = 12, dpi = 700)
+}
+```
+
+## 11b. ANCOM-BC2
+
+ANCOM-BC2 models the sampling fraction bias inherent to compositional data, which DESeq2 does not. Run at the **Genus** level here (aggregating ASVs to genus is common for DA and reduces multiple-testing burden); To test ASVs directly, set "tax_level = NULL"
+
+```{r da-ancombc2}
+library(ANCOMBC)
+library(microbiome)
+
+set.seed(123)
+anc <- ancombc2(
+  data = ps_da,
+  tax_level = "Genus",
+  fix_formula = "When",
+  group = "When",
+  p_adj_method = "BH",
+  prv_cut = 0.10, # prevalence filter inside ANCOM-BC
+  struc_zero = TRUE,
+  n_cl = TAX_THREADS,
+  verbose = TRUE
+)
+
+anc_res <- anc$res
+# effect/q-value cols are named after the contrast, e.g. "WhenLate"
+lfc_col <- grep("^lfc_When", names(anc_res), value = TRUE)
+q_col <- grep("^q_When", names(anc_res), value = TRUE)
+diff_col <- grep("^diff_When", names(anc_res), value = TRUE)
+anc_sig <- anc_res[anc_res[[diff_col]] == TRUE, c("taxon", lfc_col, q_col)]
+anc_sig <- anc_sig[order(anc_sig[[lfc_col]]), ]
+
+cat("ANCOM-BC2: differentially abundant genera:", nrow(anc_sig), "\n")
+head(anc_sig, 20)
+
+write.csv(anc_sig, file = file.path(table_dir, "differentially abundant genera.csv"), row.names = TRUE)
+saveRDS(anc, file.path(rds_dir, "ancombc2_full.rds"))
+saveRDS(anc_sig, file.path(rds_dir, "ancombc2_sig.rds"))
+```
+
+```{r da-ancombc2-lot, fig.width=9, fig.height=6}
+if (nrow(anc_sig) > 0) {
+  anc_sig$taxon <- factor(anc_sig$taxon, levels = anc_sig$taxon[order(anc_sig[[lfc_col]])])
+  
+p_ancom <- ggplot(anc_sig, aes(x = .data[[lfc_col]], y = taxon)) + geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") + geom_col(fill = "steelblue", alpha = 0.85) +
+    labs(title = "ANCOM-BC2: Early vs Late (positive = enriched in Late)", x = "Bias-corrected log gold change", y = "Genus")
+}
+
+ggsave(filename = file.path(plot_dir, "da_ancombc2_plot.png"), plot = p_ancom, width = 18, height = 12, dpi = 700)
+```
+
+## 11c. Cross-check the two methods
+
+> **Interpretation.** Taxa flagged by **both** methods are your most robust hits — report those with the most confidence. Method-specific hits are worth mentioning but should be flagged as less certain. ANCOM-BC2 is generally the more defensible primary result for compositional data; DESeq2 serves as a familiar sanity check.
+
+```{r da-compare}
+# genera flagged by DESeq2 (mapped from ASV-level results)
+deseq_genera <- unique(na.omit(sigtab$Genus))
+ancom_genera <- if (nrow(anc_sig))
+  as.character(anc_sig$taxon) else character(0)
+
+cat("DESEq2 genera:", length(deseq_genera), 
+    "| ANCOM-BC2 genera:", length(ancom_genera),
+    "| overlap:", length(intersect(deseq_genera, ancom_genera)), "\n")
+intersect(deseq_genera, ancom_genera)
+```
+
+# Session Info
+```{r session-info}
+sessionInfo()
+```
+
+# Save everything in your environment to a specific file
+```{save image}
+save.image(file = "16S_dada2_full_data_pipeline.RData")
+```
