@@ -30,7 +30,7 @@ knitr::opts_chunk$set(
 )
 ```
 
-Download the 16S reference genome (to be used for taxonomy here: [**https://zenodo.org/records/4587955**](https://zenodo.org/records/4587955){.uri} (SILVA v138.1)) *silva_nr99_v138.1_train_set.fa.gz* - train data *silva_species_assignment_v138.1.fa.gz* - species data
+The 16S reference genome (to be used for taxonomy: [**https://zenodo.org/records/4587955**](https://zenodo.org/records/4587955){.uri} (SILVA v138.1)) *silva_nr99_v138.1_train_set.fa.gz* - training data *silva_species_assignment_v138.1.fa.gz* - species data
 
 ## Package Installation
 
@@ -91,10 +91,10 @@ silva_species <- file.path(ref_dir, "silva_species_assignment_v138.1.fa.gz")
 
 # Threading (for memory and faster processing)
 N_THREADS <- max(1, parallel::detectCores() - 1) # for filtering/denoising
-TAX_THREADS <- 2 # keep low for taxonomy genx
+TAX_THREADS <- 2 # kept low for taxonomy genx
 TAX_CHUNK <- 2000 # ASVs per taxonomy batch
 
-# Helper: report current R memory use
+# Helper: reports current R memory use
 mem_report <- function(tag = "") {
   gc(full = TRUE)
   used_mb <- sum(gc()[, "used"] * c(8,8)) / 1e6
@@ -105,7 +105,7 @@ mem_report <- function(tag = "") {
 
 ## The Dataset
 
-This is the full **Schloss lab** mouse-gut dataset with the following convention
+The full **Schloss lab** mouse-gut dataset with the following convention
 
 ```         
 M1D13_S12_L001_R1_001.fastq.gz
@@ -117,7 +117,7 @@ M1D13_S12_L001_R1_001.fastq.gz
   └────────────────── sample id (M1D13)
 ```
 
-## Read in and sort the fastq file names
+## Reading in and sorting the fastq file names
 
 ```{r list-fastqs}
 # forward (R1) and reverse (R2) reads
@@ -129,7 +129,7 @@ sample.names <- sapply(strsplit(basename(dataF), "_"), `[`, 1)
 cat("Forward files:", length(dataF)," Reverse files:", length(dataR), "\n")
 cat("First few samples:", paste(head(sample.names), collapse = ", "), "\n")
 
-# sanity checks
+# checks
 stopifnot(length(dataF) == length(dataR))
 # confirm R1/R2 line up sample-for-sample
 ok <- identical(
@@ -139,7 +139,7 @@ ok <- identical(
 stopifnot(ok)
 ```
 
-## Step 1: Inspect Read Quality Profiles
+## Inspecting Read Quality Profiles
 
 ```{r qc-forward}
 library(ggplot2)
@@ -154,7 +154,7 @@ print(p_qc_r)
 ggsave(filename = file.path(plot_dir, "qc_reverse.png"), plot = p_qc_r, width = 14, height = 10, dpi = 300)
 ```
 
-## Step 2: Filter and Trim
+## Filtering and Trimming
 
 ```{r filter-paths}
 filt.dataF <- file.path(filt_dir, paste0(sample.names, "_F_filt.fastq.gz"))
@@ -181,7 +181,7 @@ out <- filterAndTrim(
 )
 head(out)
 
-# some samples can lose ALL reads after filtering which can break downstream steps - drop them
+# some samples can lose ALL reads after filtering which can break downstream steps - so are dropped
 kept <- file.exists(filt.dataF) &
   file.exists(filt.dataR)
 if (any(!kept)) {
@@ -204,7 +204,7 @@ p_post_f <- plotQualityProfile(filt.dataF[1:16], aggregate = FALSE)
 ggsave(filename = file.path(plot_dir, "qc_forward_post_filter.png"), plot = p_post_f, width = 14, height = 10, dpi = 700)
 ```
 
-## Step 3: Learn the Error Rates
+## Learning the Error Rates
 
 ```{r learn-errors}
 errF <- learnErrors(filt.dataF, multithread = N_THREADS)
@@ -223,9 +223,9 @@ p_err_r <- plotErrors(errR, nominalQ = TRUE)
 ggsave(filename = file.path(plot_dir, "errors_reverse.png"), plot = p_err_r, width = 14, height = 10, dpi = 700)
 ```
 
-## Steps 4 - 5: Denoise + Merge
+## Denoising and Merging
 
-This is a memory-critical step and requires optimization. Instead of calling `dada2()` on **all** samples at once, loop **one sample at a time**: `dereplicate -> denoise F -> denoise R -> merge -> store only merged result -> free everything else -> gc()`
+This is memory-critical and requires optimization. Instead of calling `dada2()` on **all** samples at once, looping **one sample at a time**: `dereplicate -> denoise F -> denoise R -> merge -> storing only merged result -> freeing everything else -> gc()`
 
 ```{r denoise-merge-loop}
 # (Re)load inputs - this block can be rerun in case session ends due to memory depletion 
