@@ -181,7 +181,7 @@ out <- filterAndTrim(
 )
 head(out)
 
-# some samples can lose ALL reads after filtering which can break downstream steps - so are dropped
+# some samples can lose ALL reads after filtering which can break downstream steps so are dropped
 kept <- file.exists(filt.dataF) &
   file.exists(filt.dataR)
 if (any(!kept)) {
@@ -269,7 +269,7 @@ saveRDS(denoisedR, file.path(rds_dir, "denoisedR.rds"))
 mem_report("after denoise+merge loop")
 ```
 
-## Step 6: Make the Sequence Table
+## Step 6: Making the Sequence Table
 
 ```{r make-seqtab}
 mergers <- readRDS(file.path(rds_dir, "mergers.rds"))
@@ -281,7 +281,7 @@ print(table(nchar(getSequences(seqtab))))
 saveRDS(seqtab, file.path(rds_dir, "seqtab.rds"))
 ```
 
-## Step 7: Remove Chimeras
+## Step 7: Removing Chimeras
 
 ```{r remove-chimeras}
 seqtab <- readRDS(file.path(rds_dir, "seqtab.rds"))
@@ -296,7 +296,7 @@ cat("Fraction of reads kept:", round(sum(seqtab.nochim) / sum(seqtab), 4), "\n")
 saveRDS(seqtab.nochim, file.path(rds_dir, "seqtab_nochim.rds"))
 ```
 
-## Step 8: Track Reads the Pipeline
+## Step 8: Tracking Reads the Pipeline
 
 ```{r track-reads}
 out <- readRDS(file.path(rds_dir, "filter_out.rds"))
@@ -308,10 +308,10 @@ seqtab.nochim <- readRDS(file.path(rds_dir, "seqtab_nochim.rds"))
 
 getM <- function(x) sum(getUniques(x))
 
-# Align the filter matrix to surviving samples
+# Aligning the filter matrix to surviving samples
 out2 <- out[paste0(sample.names, "_F_filt.fastq.gz") %in% basename(names(denoisedF)) | TRUE, , drop = FALSE]
 
-# rebuild from saved pieces matched by sample_id
+# rebuilding from saved pieces matched by sample_id
 track <- cbind(
   input = out[, "reads.in"][seq_along(sample.names)],
   filtered = out[, "reads.out"][seq_along(sample.names)],
@@ -323,11 +323,11 @@ track <- cbind(
 rownames(track) <- sample.names
 head(track, 10)
 
-# Export processing tracking summary table
+# Exporting processing tracking summary table
 write.csv(track, file = file.path(table_dir, "pipeline_read_tracking.csv"), row.names = TRUE)
 ```
 
-## Step 9: Assign Taxonomy - **chunked + low-thread**
+## Step 9: Assigning Taxonomy - **chunked + low-thread**
 
 ```{r assign-taxonomy-chunked}
 seqtab.nochim <- readRDS(file.path(rds_dir, "seqtab_nochim.rds"))
@@ -351,7 +351,7 @@ for (i in seq_along(chunks)) {
 taxa <- do.call(rbind, taxa_chunks)
 rm(taxa_chunks); gc(full = TRUE)
 
-# Species assignment - only run this if you have the species files
+# Species assignment 
 if (file.exists(silva_species)) {
   sp_chunks <- split(rownames(taxa), ceiling(seq_len(nrow(taxa)) / TAX_CHUNK))
   taxa_sp <- vector("list", length(sp_chunks))
@@ -377,7 +377,7 @@ table(taxa[, "Phylum"], useNA = "ifany")
 cat("ASVs with a species-level call:", sum(!is.na(taxa[, "Species"])), "of", nrow(taxa), "\n")
 ```
 
-## Step 10: Build the Phyloseq object
+## Step 10: Building the Phyloseq object
 
 ```{r load-phyloseq}
 library(phyloseq)
@@ -410,7 +410,7 @@ samdf <- data.frame(
 # Early vs Late
 samdf$When <- ifelse(samdf$Day < 100, "Early", "Late")
 
-# Mock/Control samples will not fit longitudinal design
+# Mock/Control samples do not fit longitudinal design
 is_ctrl <- grepl("mock|control|blank|ntc", samples.out, ignore.case = TRUE) | is.na(samdf$Day)
 samdf$When[is_ctrl] <- NA
 samdf$Subject[is_ctrl] <- NA
@@ -419,7 +419,7 @@ write.csv(samdf, file = file.path(table_dir, "sample metadata.csv"), row.names =
 table(samdf$When, useNA = "ifany")
 ```
 
-## Construct the object
+## Constructing the object
 
 ```{r build-phyloseq}
 ps <- phyloseq(
@@ -428,7 +428,7 @@ ps <- phyloseq(
   tax_table(taxa)
 )
 
-# replace long ASV sequences with short labels; keep sequences in refseq()
+# replacing long ASV sequences with short labels, keeping sequences in refseq()
 dna <- Biostrings::DNAStringSet(taxa_names(ps))
 names(dna) <- taxa_names(ps)
 ps <- merge_phyloseq(ps, dna)
@@ -537,8 +537,6 @@ ggsave(filename = file.path(plot_dir, "da_deseq2_plot.png"), plot = p_deseq, wid
 
 ## 11b. ANCOM-BC2
 
-ANCOM-BC2 models the sampling fraction bias inherent to compositional data, which DESeq2 does not. Run at the **Genus** level here (aggregating ASVs to genus is common for DA and reduces multiple-testing burden); To test ASVs directly, set "tax_level = NULL"
-
 ```{r da-ancombc2}
 library(ANCOMBC)
 library(microbiome)
@@ -583,9 +581,7 @@ p_ancom <- ggplot(anc_sig, aes(x = .data[[lfc_col]], y = taxon)) + geom_vline(xi
 ggsave(filename = file.path(plot_dir, "da_ancombc2_plot.png"), plot = p_ancom, width = 18, height = 12, dpi = 700)
 ```
 
-## 11c. Cross-check the two methods
-
-> **Interpretation.** Taxa flagged by **both** methods are your most robust hits — report those with the most confidence. Method-specific hits are worth mentioning but should be flagged as less certain. ANCOM-BC2 is generally the more defensible primary result for compositional data; DESeq2 serves as a familiar sanity check.
+## 11c. Cross-checking the two methods
 
 ```{r da-compare}
 # genera flagged by DESeq2 (mapped from ASV-level results)
